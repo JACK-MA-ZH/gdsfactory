@@ -96,7 +96,9 @@ class DRCToolEnv(BaseImageToolEnv):
                 abs_path = self.data_root_dir / rel_path
                 if not abs_path.exists():
                     raise FileNotFoundError(f"GDS file not found at {abs_path}")
-                component = gf.import_gds(str(abs_path))
+                component = gf.import_gds(
+                    str(abs_path), rename_duplicated_cells=True
+                )
                 _ensure_reference_names(component)
                 loaded_components.append(component)
         elif components:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import uuid
 from typing import Dict, List, Sequence, Tuple
 
 try:  # pragma: no cover - optional dependency for HuggingFace datasets
@@ -51,7 +52,7 @@ def add_named_polygon(
     *,
     layer: Tuple[int, int] = (1, 0),
     name: str,
-) -> None:
+) -> gf.Component:
     """Add a polygon reference to ``component`` and remember its name for plotting."""
 
     polygon_component = gf.Component()
@@ -83,6 +84,8 @@ def add_named_polygon(
             polygon.shape.property(POLYGON_NAME_PROPERTY_ID, name)
     except Exception:
         pass
+
+    return polygon_component
 
 
 def save_component_plot(component_to_plot: gf.Component, title: str, file_path: str) -> None:
@@ -131,17 +134,22 @@ def create_drc_dataset(output_dir: str, num_samples: int, split: str) -> dataset
     os.makedirs(gds_dir, exist_ok=True)
     os.makedirs(png_dir, exist_ok=True)
 
+    run_tag = uuid.uuid4().hex[:8]
+
     for index in range(num_samples):
-        component = gf.Component(f"{split}_clean_{index}")
-        add_named_polygon(
+        component_name = f"{split}_clean_{index}_{run_tag}"
+        component = gf.Component(component_name)
+        cleanup_cells: List[gf.Component] = [component]
+        polygon_cell = add_named_polygon(
             component,
             [(0, 0), (1, 0), (1, 1), (0, 1)],
             layer=(1, 0),
             name="p1",
         )
+        cleanup_cells.append(polygon_cell)
 
-        gds_path_rel = os.path.join("gds", f"{split}_clean_{index}.gds")
-        png_path_rel = os.path.join("png", f"{split}_clean_{index}.png")
+        gds_path_rel = os.path.join("gds", f"{component_name}.gds")
+        png_path_rel = os.path.join("png", f"{component_name}.png")
         gds_path_abs = os.path.join(output_dir, gds_path_rel)
         png_path_abs = os.path.join(output_dir, png_path_rel)
 
@@ -167,6 +175,12 @@ def create_drc_dataset(output_dir: str, num_samples: int, split: str) -> dataset
                 "reward_model": {"style": "rule", "ground_truth": ""},
             }
         )
+
+        for cell in cleanup_cells:
+            try:
+                cell.delete()
+            except Exception:
+                pass
 
     df = pd.DataFrame(data)
     if datasets is None:
