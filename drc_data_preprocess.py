@@ -7,7 +7,11 @@ import os
 import shutil
 from typing import Dict, Iterable, List, Sequence, Tuple
 
-import datasets
+try:  # pragma: no cover - optional dependency for HuggingFace datasets
+    import datasets
+except ImportError:
+    datasets = None
+
 import gdsfactory as gf
 import matplotlib.pyplot as plt
 import numpy as np
@@ -16,6 +20,29 @@ from matplotlib.patches import Polygon
 
 POLYGON_LABELS_KEY = "polygon_labels"
 POLYGON_NAME_PROPERTY_ID = 1
+
+
+class _FallbackDataset(list):
+    """Light-weight dataset replacement used when :mod:`datasets` is unavailable."""
+
+    @classmethod
+    def from_pandas(cls, df: pd.DataFrame) -> "_FallbackDataset":
+        return cls(df.to_dict(orient="records"))
+
+    def to_parquet(self, path: str) -> None:
+        pd.DataFrame(list(self)).to_parquet(path)
+
+
+def _ensure_named_instance_maps(
+    component: gf.Component,
+) -> Tuple[Dict[str, gf.Component], Dict[str, gf.ComponentReference]]:
+    """Ensure ``component`` exposes dictionaries for named references and instances."""
+
+    if not hasattr(component, "named_references") or component.named_references is None:
+        component.named_references = {}
+    if not hasattr(component, "named_instances") or component.named_instances is None:
+        component.named_instances = {}
+    return component.named_references, component.named_instances
 
 
 def polygon_centroid(points: np.ndarray) -> Tuple[float, float]:
@@ -64,13 +91,16 @@ def add_named_polygon(
     layer: Tuple[int, int] = (1, 0),
     name: str,
 ) -> None:
-    """Add a polygon to ``component`` and remember its name for plotting.
+    """Add a polygon reference to ``component`` and remember its name for plotting."""
 
-    The polygon's centroid and layer index are stored in ``component.info`` so the
-    plotting helper can recover the label later.
-    """
+    polygon_component = gf.Component()
+    polygon_component.add_polygon(points, layer=layer)
+    reference = component.add_ref(polygon_component, name=name)
 
-    shape = component.add_polygon(points, layer=layer)
+    named_refs, named_instances = _ensure_named_instance_maps(component)
+    named_refs[name] = polygon_component
+    named_instances[name] = reference
+
     points_array = np.asarray(points, dtype=float)
     centroid = polygon_centroid(points_array)
 
@@ -88,7 +118,8 @@ def add_named_polygon(
 
     # Try to attach the name to the underlying KLayout shape for completeness.
     try:
-        shape.set_property(POLYGON_NAME_PROPERTY_ID, name)
+        for polygon in polygon_component.polygons:
+            polygon.shape.property(POLYGON_NAME_PROPERTY_ID, name)
     except Exception:
         pass
 
@@ -220,6 +251,8 @@ def create_drc_dataset(output_dir: str, num_samples: int, split: str) -> dataset
         )
 
     df = pd.DataFrame(data)
+    if datasets is None:
+        return _FallbackDataset.from_pandas(df)
     return datasets.Dataset.from_pandas(df)
 
 
