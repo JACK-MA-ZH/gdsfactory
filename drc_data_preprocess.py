@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 try:  # pragma: no cover - optional dependency for HuggingFace datasets
     import datasets
@@ -16,9 +16,9 @@ import gdsfactory as gf
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib.patches import Polygon
 
-POLYGON_LABELS_KEY = "polygon_labels"
+from drc_tool import POLYGON_LABELS_KEY, polygon_centroid, plot_with_labels_and_vertices
+
 POLYGON_NAME_PROPERTY_ID = 1
 
 
@@ -30,7 +30,7 @@ class _FallbackDataset(list):
         return cls(df.to_dict(orient="records"))
 
     def to_parquet(self, path: str) -> None:
-        pd.DataFrame(list(self)).to_parquet(path)
+        _write_dataframe_with_fallback(pd.DataFrame(list(self)), path)
 
 
 def _ensure_named_instance_maps(
@@ -43,45 +43,6 @@ def _ensure_named_instance_maps(
     if not hasattr(component, "named_instances") or component.named_instances is None:
         component.named_instances = {}
     return component.named_references, component.named_instances
-
-
-def polygon_centroid(points: np.ndarray) -> Tuple[float, float]:
-    """Return the centroid of a polygon described by ``points``.
-
-    Parameters
-    ----------
-    points:
-        Nx2 array-like containing the polygon vertices in order.
-    """
-
-    if len(points) == 0:
-        raise ValueError("Cannot compute centroid of empty polygon.")
-
-    # Ensure numpy array with float dtype for calculations
-    pts = np.asarray(points, dtype=float)
-    x = pts[:, 0]
-    y = pts[:, 1]
-
-    area_accumulator = 0.0
-    cx_accumulator = 0.0
-    cy_accumulator = 0.0
-
-    for idx in range(len(pts)):
-        jdx = (idx + 1) % len(pts)
-        cross = x[idx] * y[jdx] - x[jdx] * y[idx]
-        area_accumulator += cross
-        cx_accumulator += (x[idx] + x[jdx]) * cross
-        cy_accumulator += (y[idx] + y[jdx]) * cross
-
-    area = area_accumulator / 2.0
-    if abs(area) < 1e-9:
-        # Fallback to arithmetic mean when polygon is degenerate
-        centroid = pts.mean(axis=0)
-        return float(centroid[0]), float(centroid[1])
-
-    cx = cx_accumulator / (6.0 * area)
-    cy = cy_accumulator / (6.0 * area)
-    return float(cx), float(cy)
 
 
 def add_named_polygon(
@@ -124,81 +85,38 @@ def add_named_polygon(
         pass
 
 
-def _build_label_lookup(component: gf.Component) -> List[Dict[str, object]]:
-    labels = component.info.get(POLYGON_LABELS_KEY, [])
-    if isinstance(labels, Iterable):
-        return [dict(entry) for entry in labels]
-    return []
+def save_component_plot(component_to_plot: gf.Component, title: str, file_path: str) -> None:
+    """Persist the annotated component plot to ``file_path``."""
 
-
-def _find_polygon_label(
-    label_entries: List[Dict[str, object]],
-    layer_index: int,
-    centroid: Tuple[float, float],
-) -> str | None:
-    for entry in label_entries:
-        if entry.get("layer_index") != layer_index:
-            continue
-        stored_centroid = entry.get("centroid")
-        if stored_centroid is None:
-            continue
-        stored_centroid = np.asarray(stored_centroid, dtype=float)
-        if np.allclose(stored_centroid, np.asarray(centroid, dtype=float), atol=1e-6):
-            return str(entry.get("name", "")) or None
-    return None
-
-
-def plot_with_labels_and_vertices(component_to_plot: gf.Component, title: str, file_path: str) -> None:
-    """Plot ``component_to_plot`` annotating vertex coordinates and polygon names."""
-
-    fig, ax = plt.subplots()
-
-    all_polygons_by_layer = component_to_plot.get_polygons_points()
-    label_entries = _build_label_lookup(component_to_plot)
-
-    for layer_index, polygons in all_polygons_by_layer.items():
-        color = "skyblue"
-        edge_color = "black"
-        if layer_index == 1:
-            color = "#1f77b4"
-        elif layer_index == 2:
-            color = "#ff7f0e"
-
-        for poly_points in polygons:
-            points_array = np.asarray(poly_points, dtype=float)
-            patch = Polygon(points_array, closed=True, color=color, alpha=0.5, ec=edge_color, lw=0.5)
-            ax.add_patch(patch)
-
-            for x_coord, y_coord in points_array:
-                ax.text(
-                    x_coord,
-                    y_coord,
-                    f"({x_coord:.1f}, {y_coord:.1f})",
-                    ha="left",
-                    va="bottom",
-                    fontsize=5,
-                    color="red",
-                )
-
-            centroid = polygon_centroid(points_array)
-            label = _find_polygon_label(label_entries, int(layer_index), centroid)
-            if label:
-                ax.text(
-                    centroid[0],
-                    centroid[1],
-                    label,
-                    ha="center",
-                    va="center",
-                    fontsize=8,
-                    color="blue",
-                    weight="bold",
-                )
-
-    ax.set_title(title)
-    ax.autoscale_view()
-    ax.set_aspect("equal")
-    plt.savefig(file_path, bbox_inches="tight")
+    fig, _ = plot_with_labels_and_vertices(component_to_plot, title)
+    fig.savefig(file_path, bbox_inches="tight")
     plt.close(fig)
+
+
+def _write_dataframe_with_fallback(df: pd.DataFrame, parquet_path: str) -> str:
+    """Try writing ``df`` to Parquet, falling back to JSON if optional deps are missing."""
+
+    try:
+        df.to_parquet(parquet_path)
+        return parquet_path
+    except (ImportError, ModuleNotFoundError, ValueError, RuntimeError) as exc:
+        fallback_path = os.path.splitext(parquet_path)[0] + ".jsonl"
+        df.to_json(fallback_path, orient="records", lines=True)
+        print(
+            "Warning: could not write Parquet file "
+            f"'{parquet_path}' ({exc}). Saved JSONL copy to '{fallback_path}'."
+        )
+        return fallback_path
+
+
+def _export_dataset(dataset, parquet_path: str) -> str:
+    """Export ``dataset`` to ``parquet_path`` with robust fallbacks."""
+
+    if hasattr(dataset, "to_pandas"):
+        df = dataset.to_pandas()  # type: ignore[assignment]
+    else:
+        df = pd.DataFrame(list(dataset))
+    return _write_dataframe_with_fallback(df, parquet_path)
 
 
 def create_drc_dataset(output_dir: str, num_samples: int, split: str) -> datasets.Dataset:
@@ -228,7 +146,7 @@ def create_drc_dataset(output_dir: str, num_samples: int, split: str) -> dataset
         png_path_abs = os.path.join(output_dir, png_path_rel)
 
         component.write_gds(gds_path_abs)
-        plot_with_labels_and_vertices(component, "drc_clean_layout", png_path_abs)
+        save_component_plot(component, "drc_clean_layout", png_path_abs)
 
         target_error_text = (
             "Create a DRC violation. Use op_split_polygon to split 'p1' "
@@ -275,11 +193,11 @@ def main() -> None:
 
     print(f"Creating DRC training dataset at {local_dir}...")
     train_dataset = create_drc_dataset(local_dir, args.train_size, "train")
-    train_dataset.to_parquet(os.path.join(local_dir, "train.parquet"))
+    _export_dataset(train_dataset, os.path.join(local_dir, "train.parquet"))
 
     print(f"Creating DRC validation dataset at {local_dir}...")
     val_dataset = create_drc_dataset(local_dir, args.val_size, "validation")
-    val_dataset.to_parquet(os.path.join(local_dir, "validation.parquet"))
+    _export_dataset(val_dataset, os.path.join(local_dir, "validation.parquet"))
 
     print(f"\nDRC multi-modal datasets created in {local_dir}")
     print("A sample record:")

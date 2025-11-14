@@ -35,6 +35,11 @@ except ImportError:  # pragma: no cover - defensive fallback
     GDS_INSTALLED = False
     GDSComponent = Any
 
+if GDS_INSTALLED:
+    from drc_tool import component_to_pil_image
+else:  # pragma: no cover - fallback when gdsfactory missing
+    component_to_pil_image = None
+
 
 def _iter_references(comp: GDSComponent) -> Iterable[Any]:  # pragma: no cover - helper
     if hasattr(comp, "insts"):
@@ -110,6 +115,24 @@ class DRCToolEnv(BaseImageToolEnv):
         if gf is None:
             raise RuntimeError("gdsfactory is required to perform DRC checks.")
 
+        try:  # Import lazily to keep klayout optional until a check is requested
+            import klayout.db as kdb
+        except ImportError as exc:  # pragma: no cover - depends on external package
+            raise RuntimeError(
+                "klayout is required to run the DRC checks. Please install klayout."
+            ) from exc
+
+        def _bbox_to_tuple(box: Any, dbu: float) -> Tuple[float, float, float, float]:
+            return (
+                float(box.left) * dbu,
+                float(box.bottom) * dbu,
+                float(box.right) * dbu,
+                float(box.top) * dbu,
+            )
+
+        min_spacing = 0.1
+        min_width = 0.12
+
         batch_results: List[Dict[str, Any]] = []
         for component in self.components:
             if component is None:
@@ -122,25 +145,26 @@ class DRCToolEnv(BaseImageToolEnv):
                 })
                 continue
 
-            if not (hasattr(component, "drc_spacing") and hasattr(component, "drc_width")):
-                batch_results.append({
-                    "count": -1,
-                    "errors_text": "Component does not expose DRC helper methods.",
-                    "errors_json": [],
-                    "bboxes": [],
-                    "component": component,
-                })
-                continue
-
             try:
-                spacing_errors = component.drc_spacing(layer=(1, 0), spacing=0.1)
-                width_errors = component.drc_width(layer=(1, 0), min_width=0.12)
+                layout = component.kcl.layout
+                dbu = float(getattr(layout, "dbu", 1.0) or 1.0)
+                layer_index = int(layout.layer(1, 0))
 
-                errors: List[Dict[str, Any]] = []
-                for poly in spacing_errors.get_polygons():
-                    errors.append({"type": "min_spacing", "bbox": poly.bounds})
-                for poly in width_errors.get_polygons():
-                    errors.append({"type": "min_width", "bbox": poly.bounds})
+                if layer_index < 0:
+                    errors: List[Dict[str, Any]] = []
+                else:
+                    region = kdb.Region(component.kdb_cell.begin_shapes_rec(layer_index))
+                    errors = []
+
+                    spacing_pairs = list(region.space_check(min_spacing / dbu).each())
+                    for pair in spacing_pairs:
+                        bbox = _bbox_to_tuple(pair.bbox(), dbu)
+                        errors.append({"type": "min_spacing", "bbox": bbox})
+
+                    width_pairs = list(region.width_check(min_width / dbu).each())
+                    for pair in width_pairs:
+                        bbox = _bbox_to_tuple(pair.bbox(), dbu)
+                        errors.append({"type": "min_width", "bbox": bbox})
 
                 errors_text = (
                     "\n".join([f"ERROR: {e['type']} at {e['bbox']}" for e in errors])
@@ -187,18 +211,20 @@ class DRCToolEnv(BaseImageToolEnv):
             raise IndexError(f"Index {item_index} is out of range for batch size {self.batch_size}.")
 
         component = self.components[item_index]
-        if gf is None or component is None or not hasattr(gf, "plot"):
+        if gf is None or component is None or component_to_pil_image is None:
             return Image.new("RGB", (100, 100), color="white")
 
-        kwargs: Dict[str, Tuple[float, float]] = {}
+        bbox_to_plot: Tuple[float, float, float, float] | None = None
         if bbox:
             dx = (bbox[2] - bbox[0]) * 0.5
             dy = (bbox[3] - bbox[1]) * 0.5
-            kwargs["xlim"] = (bbox[0] - dx, bbox[2] + dx)
-            kwargs["ylim"] = (bbox[1] - dy, bbox[3] + dy)
+            bbox_to_plot = (bbox[0] - dx, bbox[1] - dy, bbox[2] + dx, bbox[3] + dy)
 
-        image_array = gf.plot.get_image(component, **kwargs)
-        return Image.fromarray(image_array, "RGBA")
+        return component_to_pil_image(
+            component,
+            title=f"component_{item_index}",
+            bbox=bbox_to_plot,
+        )
 
     # ------------------------------------------------------------------
     def step(
