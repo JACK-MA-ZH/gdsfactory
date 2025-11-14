@@ -30,7 +30,7 @@ class _FallbackDataset(list):
         return cls(df.to_dict(orient="records"))
 
     def to_parquet(self, path: str) -> None:
-        pd.DataFrame(list(self)).to_parquet(path)
+        _write_dataframe_with_fallback(pd.DataFrame(list(self)), path)
 
 
 def _ensure_named_instance_maps(
@@ -91,6 +91,32 @@ def save_component_plot(component_to_plot: gf.Component, title: str, file_path: 
     fig, _ = plot_with_labels_and_vertices(component_to_plot, title)
     fig.savefig(file_path, bbox_inches="tight")
     plt.close(fig)
+
+
+def _write_dataframe_with_fallback(df: pd.DataFrame, parquet_path: str) -> str:
+    """Try writing ``df`` to Parquet, falling back to JSON if optional deps are missing."""
+
+    try:
+        df.to_parquet(parquet_path)
+        return parquet_path
+    except (ImportError, ModuleNotFoundError, ValueError, RuntimeError) as exc:
+        fallback_path = os.path.splitext(parquet_path)[0] + ".jsonl"
+        df.to_json(fallback_path, orient="records", lines=True)
+        print(
+            "Warning: could not write Parquet file "
+            f"'{parquet_path}' ({exc}). Saved JSONL copy to '{fallback_path}'."
+        )
+        return fallback_path
+
+
+def _export_dataset(dataset, parquet_path: str) -> str:
+    """Export ``dataset`` to ``parquet_path`` with robust fallbacks."""
+
+    if hasattr(dataset, "to_pandas"):
+        df = dataset.to_pandas()  # type: ignore[assignment]
+    else:
+        df = pd.DataFrame(list(dataset))
+    return _write_dataframe_with_fallback(df, parquet_path)
 
 
 def create_drc_dataset(output_dir: str, num_samples: int, split: str) -> datasets.Dataset:
@@ -167,11 +193,11 @@ def main() -> None:
 
     print(f"Creating DRC training dataset at {local_dir}...")
     train_dataset = create_drc_dataset(local_dir, args.train_size, "train")
-    train_dataset.to_parquet(os.path.join(local_dir, "train.parquet"))
+    _export_dataset(train_dataset, os.path.join(local_dir, "train.parquet"))
 
     print(f"Creating DRC validation dataset at {local_dir}...")
     val_dataset = create_drc_dataset(local_dir, args.val_size, "validation")
-    val_dataset.to_parquet(os.path.join(local_dir, "validation.parquet"))
+    _export_dataset(val_dataset, os.path.join(local_dir, "validation.parquet"))
 
     print(f"\nDRC multi-modal datasets created in {local_dir}")
     print("A sample record:")
