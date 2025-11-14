@@ -1,8 +1,8 @@
-from typing import Dict, Any, List
-import sys  
-sys.path.append('.')
-from agent_r1.tool.base import BaseTool
 from __future__ import annotations
+
+from typing import Dict, Any, List
+import sys
+sys.path.append('.')
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,7 +22,14 @@ from gdsfactory.boolean import get_ref_shapes
 from gdsfactory.typings import component
 import klayout.db as kdb
 
-from agent_r1.tool.base import BaseTool
+try:  # pragma: no cover - optional dependency when running outside the agent stack
+    from agent_r1.tool.base import BaseTool
+except ImportError:  # pragma: no cover - simple fallback for local testing
+    class BaseTool:  # type: ignore[override]
+        name = "base_tool"
+
+        def execute(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+            raise NotImplementedError
 
 
 _COLOR_CYCLE = plt.rcParams.get("axes.prop_cycle", None)
@@ -34,6 +41,34 @@ def _iter_references(comp: component) -> Iterable[gf.ComponentReference]:
     if hasattr(comp, "insts"):
         for inst in comp.insts:
             yield inst
+    elif hasattr(comp, "references"):
+        for ref in comp.references:
+            yield ref
+
+
+def _ensure_named_instance_map(component: component) -> Dict[str, gf.ComponentReference]:
+    if not hasattr(component, "named_instances") or component.named_instances is None:
+        component.named_instances = {}
+    return component.named_instances
+
+
+def _register_reference_name(component: component, name: str, reference: gf.ComponentReference) -> None:
+    mapping = _ensure_named_instance_map(component)
+    mapping[name] = reference
+
+
+def _remove_reference_name(component: component, name: str) -> None:
+    mapping = _ensure_named_instance_map(component)
+    mapping.pop(name, None)
+
+
+def _remove_reference(component: component, reference: gf.ComponentReference) -> None:
+    if hasattr(component, "insts") and reference in component.insts:
+        component.insts.remove(reference)
+    elif hasattr(component, "references") and reference in component.references:
+        component.references.remove(reference)
+    else:
+        raise ValueError("Component reference not found; cannot remove.")
 
 
 @dataclass(slots=True)
@@ -43,6 +78,11 @@ class _ReferenceMatch:
 
 
 def _find_reference_by_name(comp: component, name: str) -> _ReferenceMatch:
+    mapping = getattr(comp, "named_instances", None)
+    if isinstance(mapping, dict) and name in mapping:
+        reference = mapping[name]
+        return _ReferenceMatch(reference=reference, index=-1)
+
     for index, ref in enumerate(_iter_references(comp)):
         if ref.name == name:
             return _ReferenceMatch(reference=ref, index=index)
@@ -103,7 +143,7 @@ class DRCBaseTool(BaseTool):
         result = self._execute(args, component)
         if result is None:
             result = {}
-        return {"status": "success", **result}
+        return {"success": True, "status": "success", **result}
 
     def _execute(self, args: Dict[str, Any], component: component) -> Dict[str, Any] | None:
         raise NotImplementedError
@@ -135,7 +175,12 @@ class MovePolygonTool(DRCBaseTool):
 
         reference = self._get_reference(component, polygon_name)
         reference.dmove((dx, dy))
-        return {"moved_reference": polygon_name, "dx": dx, "dy": dy}
+        return {
+            "content": f"Moved polygon {polygon_name} by dx={dx}, dy={dy}.",
+            "polygon": polygon_name,
+            "dx": dx,
+            "dy": dy,
+        }
 
 
 class DeletePolygonTool(DRCBaseTool):
@@ -154,8 +199,9 @@ class DeletePolygonTool(DRCBaseTool):
     def _execute(self, args: Dict[str, Any], component: component) -> Dict[str, Any] | None:
         polygon_name = args["polygon_name"]
         reference_match = _find_reference_by_name(component, polygon_name)
-        component.insts.remove(reference_match.reference)
-        return {"deleted_reference": polygon_name}
+        _remove_reference(component, reference_match.reference)
+        _remove_reference_name(component, polygon_name)
+        return {"content": f"Deleted polygon {polygon_name}."}
 
 
 class OffsetPolygonTool(DRCBaseTool):
@@ -196,13 +242,19 @@ class OffsetPolygonTool(DRCBaseTool):
         region = get_ref_shapes(reference, layer_index)
         region = region.size(distance_dbu)
 
-        component.insts.remove(reference)
+        _remove_reference(component, reference)
+        _remove_reference_name(component, polygon_name)
 
         new_component = gf.Component(name=f"{polygon_name}_offset")
         new_component.kdb_cell.shapes(layer_index).insert(region)
 
-        component.add_ref(new_component, name=polygon_name)
-        return {"offset_reference": polygon_name, "distance": distance}
+        new_reference = component.add_ref(new_component, name=polygon_name)
+        _register_reference_name(component, polygon_name, new_reference)
+        return {
+            "content": f"Offset polygon {polygon_name} by distance {distance} on layer {layer_tuple}.",
+            "polygon": polygon_name,
+            "distance": distance,
+        }
 
 
 class SplitPolygonTool(DRCBaseTool):
@@ -250,17 +302,24 @@ class SplitPolygonTool(DRCBaseTool):
         inside = gf.boolean(reference, mask, operation="and", layer=layer_tuple)
         outside = gf.boolean(reference, mask, operation="A-B", layer=layer_tuple)
 
-        component.insts.remove(reference)
+        _remove_reference(component, reference)
+        _remove_reference_name(component, polygon_name)
 
         new_refs: List[str] = []
         if inside.get_polygons():
             ref_inside = component.add_ref(inside, name=f"{polygon_name}_part1")
+            _register_reference_name(component, ref_inside.name, ref_inside)
             new_refs.append(ref_inside.name)
         if outside.get_polygons():
             ref_outside = component.add_ref(outside, name=f"{polygon_name}_part2")
+            _register_reference_name(component, ref_outside.name, ref_outside)
             new_refs.append(ref_outside.name)
 
-        return {"split_reference": polygon_name, "new_references": new_refs}
+        return {
+            "content": f"Split polygon {polygon_name} into {', '.join(new_refs)}.",
+            "original_polygon": polygon_name,
+            "new_references": new_refs,
+        }
 
 
 def _create_demo_component() -> component:
