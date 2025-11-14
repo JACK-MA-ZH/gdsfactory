@@ -3,13 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
-import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
-
-MIN_WIDTH_UM = 0.12
-MIN_SPACING_UM = 0.1
-DEFAULT_DRC_LAYER = (1, 0)
 
 from PIL import Image
 
@@ -40,14 +35,6 @@ except ImportError:  # pragma: no cover - defensive fallback
     GDS_INSTALLED = False
     GDSComponent = Any
 
-try:  # pragma: no cover - optional dependency for geometry-accurate checks
-    import klayout.db as kdb
-
-    KLAYOUT_AVAILABLE = True
-except ImportError:  # pragma: no cover - defensive fallback when klayout isn't installed
-    kdb = None
-    KLAYOUT_AVAILABLE = False
-
 
 def _iter_references(comp: GDSComponent) -> Iterable[Any]:  # pragma: no cover - helper
     if hasattr(comp, "insts"):
@@ -66,188 +53,6 @@ def _ensure_reference_names(comp: GDSComponent) -> None:
         if not getattr(reference, "name", None):
             reference.name = f"p{index}"
         comp.named_instances[reference.name] = reference
-
-
-def _component_polygons(component: GDSComponent, layer: Tuple[int, int]) -> List[Tuple[float, float, float, float]]:
-    """Returns bounding boxes for every polygon on ``layer``.
-
-    The helper inspects the raw polygon data provided by gdsfactory, converts it to
-    axis-aligned bounding boxes, and filters out degenerate polygons.  The DRC
-    routines only need bounding boxes because we restrict ourselves to simple width
-    and spacing checks in this environment.
-    """
-
-    polygons: List[Tuple[float, float, float, float]] = []
-    try:
-        polygons_by_layer = component.get_polygons(by_spec=True)
-    except Exception:  # pragma: no cover - defensive fallback
-        polygons_by_layer = {}
-
-    for spec, polys in polygons_by_layer.items():
-        if tuple(spec) != layer:
-            continue
-        for poly in polys:
-            if len(poly) < 3:
-                continue
-            xs = [float(pt[0]) for pt in poly]
-            ys = [float(pt[1]) for pt in poly]
-            bbox = (min(xs), min(ys), max(xs), max(ys))
-            polygons.append(bbox)
-    return polygons
-
-
-def _bbox_distance(b1: Tuple[float, float, float, float], b2: Tuple[float, float, float, float]) -> float:
-    """Compute the minimum distance between two axis-aligned bounding boxes."""
-
-    if b1[2] < b2[0]:
-        dx = b2[0] - b1[2]
-    elif b2[2] < b1[0]:
-        dx = b1[0] - b2[2]
-    else:
-        dx = 0.0
-
-    if b1[3] < b2[1]:
-        dy = b2[1] - b1[3]
-    elif b2[3] < b1[1]:
-        dy = b1[1] - b2[3]
-    else:
-        dy = 0.0
-
-    return (dx**2 + dy**2) ** 0.5
-
-
-def _run_width_checks(
-    bboxes: Sequence[Tuple[float, float, float, float]],
-    min_width: float,
-) -> List[Dict[str, Any]]:
-    errors: List[Dict[str, Any]] = []
-    for bbox in bboxes:
-        width = bbox[2] - bbox[0]
-        height = bbox[3] - bbox[1]
-        min_feature = min(width, height)
-        if min_feature < min_width:
-            errors.append({"type": "min_width", "bbox": bbox, "measured": min_feature})
-    return errors
-
-
-def _run_spacing_checks(
-    bboxes: Sequence[Tuple[float, float, float, float]],
-    min_spacing: float,
-) -> List[Dict[str, Any]]:
-    errors: List[Dict[str, Any]] = []
-    for i in range(len(bboxes)):
-        for j in range(i + 1, len(bboxes)):
-            bbox_a = bboxes[i]
-            bbox_b = bboxes[j]
-            distance = _bbox_distance(bbox_a, bbox_b)
-            if distance < min_spacing:
-                errors.append(
-                    {
-                        "type": "min_spacing",
-                        "bbox": (
-                            min(bbox_a[0], bbox_b[0]),
-                            min(bbox_a[1], bbox_b[1]),
-                            max(bbox_a[2], bbox_b[2]),
-                            max(bbox_a[3], bbox_b[3]),
-                        ),
-                        "measured": distance,
-                        "pair": (i, j),
-                    }
-                )
-    return errors
-
-
-def _format_error_text(errors: Sequence[Dict[str, Any]]) -> str:
-    if not errors:
-        return "No DRC errors found."
-    lines = []
-    for error in errors:
-        measured = error.get("measured")
-        measured_txt = f" (measured {measured:.3f} um)" if isinstance(measured, float) else ""
-        lines.append(f"ERROR: {error['type']} at {error['bbox']}{measured_txt}")
-    return "\n".join(lines)
-
-
-def _write_component_to_temp_gds(component: GDSComponent) -> Path:
-    temp = tempfile.NamedTemporaryFile(suffix=".gds", delete=False)
-    temp_path = Path(temp.name)
-    temp.close()
-    component.write_gds(str(temp_path))
-    return temp_path
-
-
-def _klayout_region_from_component(
-    component: GDSComponent, layer: Tuple[int, int]
-) -> Tuple[Any, Any]:
-    if not KLAYOUT_AVAILABLE:
-        raise RuntimeError("klayout is required for this operation.")
-
-    temp_path = _write_component_to_temp_gds(component)
-    try:
-        layout = kdb.Layout()
-        layout.read(str(temp_path))
-    finally:
-        try:
-            temp_path.unlink()
-        except OSError:
-            pass
-
-    top_cell = layout.top_cell()
-    if top_cell is None:
-        return layout, kdb.Region()
-
-    layer_index = layout.layer(layer[0], layer[1])
-    if layer_index < 0:
-        return layout, kdb.Region()
-
-    region = kdb.Region(top_cell.begin_shapes_rec(layer_index))
-    return layout, region
-
-
-def _edge_pairs_to_errors(edge_pairs: Any, error_type: str, dbu: float) -> List[Dict[str, Any]]:
-    errors: List[Dict[str, Any]] = []
-    for pair in edge_pairs:
-        bbox = pair.bbox()
-        bbox_um = (
-            float(bbox.left) * dbu,
-            float(bbox.bottom) * dbu,
-            float(bbox.right) * dbu,
-            float(bbox.top) * dbu,
-        )
-        errors.append(
-            {
-                "type": error_type,
-                "bbox": bbox_um,
-                "measured": float(pair.distance()) * dbu,
-            }
-        )
-    return errors
-
-
-def _run_klayout_drc(
-    component: GDSComponent,
-    layer: Tuple[int, int],
-    min_width: float,
-    min_spacing: float,
-) -> List[Dict[str, Any]]:
-    layout, region = _klayout_region_from_component(component, layer)
-    if region.is_empty():
-        return []
-
-    dbu = float(layout.dbu)
-    errors: List[Dict[str, Any]] = []
-
-    if min_width > 0:
-        min_width_dbu = max(1, int(round(min_width / dbu)))
-        width_pairs = region.width_check(min_width_dbu)
-        errors.extend(_edge_pairs_to_errors(width_pairs, "min_width", dbu))
-
-    if min_spacing > 0:
-        min_spacing_dbu = max(1, int(round(min_spacing / dbu)))
-        spacing_pairs = region.space_check(min_spacing_dbu)
-        errors.extend(_edge_pairs_to_errors(spacing_pairs, "min_spacing", dbu))
-
-    return errors
 
 
 class DRCToolEnv(BaseImageToolEnv):
@@ -317,16 +122,31 @@ class DRCToolEnv(BaseImageToolEnv):
                 })
                 continue
 
+            if not (hasattr(component, "drc_spacing") and hasattr(component, "drc_width")):
+                batch_results.append({
+                    "count": -1,
+                    "errors_text": "Component does not expose DRC helper methods.",
+                    "errors_json": [],
+                    "bboxes": [],
+                    "component": component,
+                })
+                continue
+
             try:
-                layer = DEFAULT_DRC_LAYER
-                if KLAYOUT_AVAILABLE:
-                    errors = _run_klayout_drc(component, layer, MIN_WIDTH_UM, MIN_SPACING_UM)
-                else:
-                    bboxes = _component_polygons(component, layer)
-                    width_errors = _run_width_checks(bboxes, MIN_WIDTH_UM)
-                    spacing_errors = _run_spacing_checks(bboxes, MIN_SPACING_UM)
-                    errors = width_errors + spacing_errors
-                errors_text = _format_error_text(errors)
+                spacing_errors = component.drc_spacing(layer=(1, 0), spacing=0.1)
+                width_errors = component.drc_width(layer=(1, 0), min_width=0.12)
+
+                errors: List[Dict[str, Any]] = []
+                for poly in spacing_errors.get_polygons():
+                    errors.append({"type": "min_spacing", "bbox": poly.bounds})
+                for poly in width_errors.get_polygons():
+                    errors.append({"type": "min_width", "bbox": poly.bounds})
+
+                errors_text = (
+                    "\n".join([f"ERROR: {e['type']} at {e['bbox']}" for e in errors])
+                    if errors
+                    else "No DRC errors found."
+                )
 
                 batch_results.append({
                     "count": len(errors),
@@ -474,4 +294,4 @@ class DRCToolEnv(BaseImageToolEnv):
         return f"<tool_response>{response_data}</tool_response>"
 
 
-__all__ = ["DRCToolEnv", "GDS_INSTALLED", "KLAYOUT_AVAILABLE"]
+__all__ = ["DRCToolEnv", "GDS_INSTALLED"]
