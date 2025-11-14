@@ -35,6 +35,11 @@ except ImportError:  # pragma: no cover - defensive fallback
     GDS_INSTALLED = False
     GDSComponent = Any
 
+if GDS_INSTALLED:
+    from drc_tool import component_to_pil_image
+else:  # pragma: no cover - fallback when gdsfactory missing
+    component_to_pil_image = None
+
 
 def _iter_references(comp: GDSComponent) -> Iterable[Any]:  # pragma: no cover - helper
     if hasattr(comp, "insts"):
@@ -187,18 +192,20 @@ class DRCToolEnv(BaseImageToolEnv):
             raise IndexError(f"Index {item_index} is out of range for batch size {self.batch_size}.")
 
         component = self.components[item_index]
-        if gf is None or component is None or not hasattr(gf, "plot"):
+        if gf is None or component is None or component_to_pil_image is None:
             return Image.new("RGB", (100, 100), color="white")
 
-        kwargs: Dict[str, Tuple[float, float]] = {}
+        bbox_to_plot: Tuple[float, float, float, float] | None = None
         if bbox:
             dx = (bbox[2] - bbox[0]) * 0.5
             dy = (bbox[3] - bbox[1]) * 0.5
-            kwargs["xlim"] = (bbox[0] - dx, bbox[2] + dx)
-            kwargs["ylim"] = (bbox[1] - dy, bbox[3] + dy)
+            bbox_to_plot = (bbox[0] - dx, bbox[1] - dy, bbox[2] + dx, bbox[3] + dy)
 
-        image_array = gf.plot.get_image(component, **kwargs)
-        return Image.fromarray(image_array, "RGBA")
+        return component_to_pil_image(
+            component,
+            title=f"component_{item_index}",
+            bbox=bbox_to_plot,
+        )
 
     # ------------------------------------------------------------------
     def step(
