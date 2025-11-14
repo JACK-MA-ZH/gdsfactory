@@ -10,7 +10,10 @@ from typing import Any, Dict, Iterable, List, Tuple
 import sys
 
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.patches import Polygon
+import numpy as np
+from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -33,6 +36,7 @@ except ImportError:  # pragma: no cover - simple fallback for local testing
 
 
 _COLOR_CYCLE = plt.rcParams.get("axes.prop_cycle", None)
+POLYGON_LABELS_KEY = "polygon_labels"
 
 
 def _iter_references(comp: component) -> Iterable[gf.ComponentReference]:
@@ -71,6 +75,102 @@ def _remove_reference(component: component, reference: gf.ComponentReference) ->
         raise ValueError("Component reference not found; cannot remove.")
 
 
+def polygon_centroid(points: np.ndarray) -> Tuple[float, float]:
+    """Return the centroid of a polygon described by ``points``."""
+
+    pts = np.asarray(points, dtype=float)
+    if len(pts) == 0:
+        raise ValueError("Cannot compute centroid of empty polygon.")
+
+    x = pts[:, 0]
+    y = pts[:, 1]
+    area_accumulator = 0.0
+    cx_accumulator = 0.0
+    cy_accumulator = 0.0
+
+    for idx in range(len(pts)):
+        jdx = (idx + 1) % len(pts)
+        cross = x[idx] * y[jdx] - x[jdx] * y[idx]
+        area_accumulator += cross
+        cx_accumulator += (x[idx] + x[jdx]) * cross
+        cy_accumulator += (y[idx] + y[jdx]) * cross
+
+    area = area_accumulator / 2.0
+    if abs(area) < 1e-9:
+        centroid = pts.mean(axis=0)
+        return float(centroid[0]), float(centroid[1])
+
+    cx = cx_accumulator / (6.0 * area)
+    cy = cy_accumulator / (6.0 * area)
+    return float(cx), float(cy)
+
+
+def _build_label_lookup(component_to_plot: component) -> List[Dict[str, object]]:
+    labels = getattr(component_to_plot, "info", {}).get(POLYGON_LABELS_KEY, [])
+    if isinstance(labels, Iterable):
+        return [dict(entry) for entry in labels]
+    return []
+
+
+def _find_polygon_label(
+    label_entries: List[Dict[str, object]],
+    layer_index: int,
+    centroid: Tuple[float, float],
+) -> str | None:
+    for entry in label_entries:
+        if entry.get("layer_index") != layer_index:
+            continue
+        stored_centroid = entry.get("centroid")
+        if stored_centroid is None:
+            continue
+        stored_centroid = np.asarray(stored_centroid, dtype=float)
+        if np.allclose(stored_centroid, np.asarray(centroid, dtype=float), atol=1e-6):
+            candidate = entry.get("name")
+            if candidate:
+                return str(candidate)
+    return None
+
+
+def _build_reference_centroids(component_to_plot: component) -> Dict[str, Tuple[float, float]]:
+    centroids: Dict[str, Tuple[float, float]] = {}
+    named_instances = getattr(component_to_plot, "named_instances", None)
+    if not isinstance(named_instances, dict):
+        return centroids
+
+    for name, reference in named_instances.items():
+        if not reference:
+            continue
+        try:
+            center = reference.center
+        except Exception:
+            try:
+                bbox = reference.bbox
+                center = ((bbox.xmin + bbox.xmax) / 2.0, (bbox.ymin + bbox.ymax) / 2.0)
+            except Exception:
+                continue
+        centroids[name] = (float(center[0]), float(center[1]))
+    return centroids
+
+
+def _match_reference_name(
+    reference_centroids: Dict[str, Tuple[float, float]],
+    centroid: Tuple[float, float],
+) -> str | None:
+    if not reference_centroids:
+        return None
+
+    target = np.asarray(centroid, dtype=float)
+    best_name: str | None = None
+    best_distance = float("inf")
+    for name, ref_centroid in reference_centroids.items():
+        diff = target - np.asarray(ref_centroid, dtype=float)
+        distance = float(np.dot(diff, diff))
+        if distance < best_distance:
+            best_distance = distance
+            best_name = name
+    return best_name
+
+
 @dataclass(slots=True)
 class _ReferenceMatch:
     reference: gf.ComponentReference
@@ -89,44 +189,104 @@ def _find_reference_by_name(comp: component, name: str) -> _ReferenceMatch:
     raise ValueError(f"Component does not contain a reference named {name!r}.")
 
 
-def plot_with_labels_and_vertices(component_to_plot: component, title: str):
-    """Plot component polygons with labels and vertex coordinates."""
+def plot_with_labels_and_vertices(
+    component_to_plot: component,
+    title: str,
+    *,
+    bbox: Tuple[float, float, float, float] | None = None,
+):
+    """Plot component polygons, annotating vertices and polygon names."""
 
-    polygons_by_layer = component_to_plot.get_polygons_points(by="tuple")
+    polygons_by_layer = component_to_plot.get_polygons_points()
     fig, ax = plt.subplots()
-
     colors = (_COLOR_CYCLE.by_key()["color"] if _COLOR_CYCLE else ["tab:blue"])
     color_count = len(colors)
     color_index = 0
 
-    for layer, polygons in polygons_by_layer.items():
+    label_entries = _build_label_lookup(component_to_plot)
+    reference_centroids = _build_reference_centroids(component_to_plot)
+
+    for layer_index, polygons in polygons_by_layer.items():
         for poly in polygons:
             color = colors[color_index % color_count]
             color_index += 1
 
-            patch = Polygon(poly, closed=True, facecolor="none", edgecolor=color)
+            points_array = np.asarray(poly, dtype=float)
+            patch = Polygon(
+                points_array,
+                closed=True,
+                facecolor=color,
+                edgecolor=color,
+                alpha=0.2,
+                linewidth=1.0,
+            )
             ax.add_patch(patch)
 
-            centroid = poly.mean(axis=0)
-            ax.text(
-                centroid[0],
-                centroid[1],
-                f"layer={layer}",
-                ha="center",
-                va="center",
-                fontsize=10,
-                color=color,
-            )
+            for x, y in points_array:
+                ax.text(
+                    x,
+                    y,
+                    f"({x:.3f}, {y:.3f})",
+                    fontsize=7,
+                    color="red",
+                    ha="left",
+                    va="bottom",
+                )
 
-            for x, y in poly:
-                ax.text(x, y, f"({x:.3f}, {y:.3f})", fontsize=8, color=color)
+            centroid = polygon_centroid(points_array)
+            label = _find_polygon_label(label_entries, int(layer_index), centroid)
+            if label is None:
+                label = _match_reference_name(reference_centroids, centroid)
+            if label:
+                ax.text(
+                    centroid[0],
+                    centroid[1],
+                    str(label),
+                    ha="center",
+                    va="center",
+                    fontsize=10,
+                    color="blue",
+                    weight="bold",
+                )
 
     ax.set_title(title)
     ax.set_aspect("equal", adjustable="box")
-    ax.autoscale()
     ax.set_xlabel("x (um)")
     ax.set_ylabel("y (um)")
+    ax.set_facecolor("white")
+
+    if bbox:
+        ax.set_xlim(bbox[0], bbox[2])
+        ax.set_ylim(bbox[1], bbox[3])
+    else:
+        ax.autoscale()
     return fig, ax
+
+
+def component_to_pil_image(
+    component_to_plot: component,
+    *,
+    title: str = "layout",
+    bbox: Tuple[float, float, float, float] | None = None,
+) -> Image.Image:
+    """Render ``component_to_plot`` to a PIL image with polygon annotations."""
+
+    fig, _ = plot_with_labels_and_vertices(component_to_plot, title, bbox=bbox)
+    canvas = FigureCanvasAgg(fig)
+    canvas.draw()
+    width, height = canvas.get_width_height()
+    image = Image.frombuffer(
+        "RGBA",
+        (width, height),
+        canvas.buffer_rgba(),
+        "raw",
+        "RGBA",
+        0,
+        1,
+    )
+    image = image.copy()
+    plt.close(fig)
+    return image
 
 
 class DRCBaseTool(BaseTool):
