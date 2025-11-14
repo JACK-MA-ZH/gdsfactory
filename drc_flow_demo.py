@@ -72,7 +72,7 @@ def main() -> None:
             "name": "op_split_polygon",
             "arguments": {
                 "polygon_name": "p1",
-                "split_line_bbox": [0.5, -0.5, 0.6, 1.5],
+                "split_line": {"axis": "x", "value": 0.55},
                 "layer": [1, 0],
             },
         }

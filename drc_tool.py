@@ -418,20 +418,29 @@ class OffsetPolygonTool(DRCBaseTool):
 
 
 class SplitPolygonTool(DRCBaseTool):
-    """Split a polygon into two pieces using a rectangular window."""
+    """Split a polygon using an infinite axis-aligned line."""
 
     name = "op_split_polygon"
-    description = "使用由边界框定义的切割矩形来分割一个“多边形”（实例）。原始“多边形”被替换为两个新的结果“多边形”。"
+    description = (
+        "使用一条无限长且与坐标轴平行的直线 (x=value 或 y=value) 来分割一个“多边形”（实例）。"
+        "原始“多边形”被替换为由该直线切割得到的两个新的“多边形”。"
+    )
     parameters = {
         "type": "object",
         "properties": {
             "polygon_name": {"type": "string", "description": "要分割的‘多边形’（实例）的名称。"},
-            "split_line_bbox": {
-                "type": "array",
-                "items": {"type": "number"},
-                "minItems": 4,
-                "maxItems": 4,
-                "description": "切割矩形的边界框 [xmin, ymin, xmax, ymax] (um)。",
+            "split_line": {
+                "type": "object",
+                "properties": {
+                    "axis": {
+                        "type": "string",
+                        "enum": ["x", "y"],
+                        "description": "决定分割直线是 x=value 还是 y=value。",
+                    },
+                    "value": {"type": "number", "description": "直线常数值 (um)。"},
+                },
+                "required": ["axis", "value"],
+                "description": "定义分割直线的轴向与常数值。",
             },
             "layer": {
                 "type": "array",
@@ -441,44 +450,99 @@ class SplitPolygonTool(DRCBaseTool):
                 "description": "GDS Layer [layer, purpose] 列表 (例如 [1, 0])。",
             },
         },
-        "required": ["polygon_name", "split_line_bbox", "layer"],
+        "required": ["polygon_name", "split_line", "layer"],
     }
+
+    @staticmethod
+    def _build_half_plane_masks(
+        reference: gf.ComponentReference,
+        axis: str,
+        value: float,
+        layer: tuple[int, int],
+    ) -> tuple[gf.Component, gf.Component]:
+        bbox = reference.bbox()
+        xmin = float(bbox.left)
+        xmax = float(bbox.right)
+        ymin = float(bbox.bottom)
+        ymax = float(bbox.top)
+        span_x = abs(xmax - xmin)
+        span_y = abs(ymax - ymin)
+        margin = max(span_x, span_y, 1.0) * 2.0
+
+        low = gf.Component(name="split_half_low")
+        high = gf.Component(name="split_half_high")
+
+        if axis == "x":
+            x_low = min(xmin - margin, value - margin)
+            x_high = max(xmax + margin, value + margin)
+            y_lo = ymin - margin
+            y_hi = ymax + margin
+            low.add_polygon(
+                [(x_low, y_lo), (value, y_lo), (value, y_hi), (x_low, y_hi)],
+                layer=layer,
+            )
+            high.add_polygon(
+                [(value, y_lo), (x_high, y_lo), (x_high, y_hi), (value, y_hi)],
+                layer=layer,
+            )
+        else:  # axis == "y"
+            y_low = min(ymin - margin, value - margin)
+            y_high = max(ymax + margin, value + margin)
+            x_lo = xmin - margin
+            x_hi = xmax + margin
+            low.add_polygon(
+                [(x_lo, y_low), (x_hi, y_low), (x_hi, value), (x_lo, value)],
+                layer=layer,
+            )
+            high.add_polygon(
+                [(x_lo, value), (x_hi, value), (x_hi, y_high), (x_lo, y_high)],
+                layer=layer,
+            )
+
+        return low, high
 
     def _execute(self, args: Dict[str, Any], component: component) -> Dict[str, Any] | None:
         polygon_name = args["polygon_name"]
-        xmin, ymin, xmax, ymax = map(float, args["split_line_bbox"])
+        split_line = args["split_line"]
+        axis = split_line.get("axis")
+        if axis not in {"x", "y"}:
+            raise ValueError("split_line.axis must be either 'x' or 'y'.")
+        try:
+            value = float(split_line["value"])
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ValueError("split_line.value must be a valid number.") from exc
+
         layer_tuple = tuple(args["layer"])
         if len(layer_tuple) != 2:
             raise ValueError("Layer must be specified as [layer, purpose].")
 
         reference = self._get_reference(component, polygon_name)
 
-        mask = gf.Component(name="split_mask")
-        mask.add_polygon(
-            [(xmin, ymin), (xmax, ymin), (xmax, ymax), (xmin, ymax)],
-            layer=layer_tuple,
-        )
-
-        inside = gf.boolean(reference, mask, operation="and", layer=layer_tuple)
-        outside = gf.boolean(reference, mask, operation="A-B", layer=layer_tuple)
+        low_mask, high_mask = self._build_half_plane_masks(reference, axis, value, layer_tuple)
+        first_half = gf.boolean(reference, low_mask, operation="and", layer=layer_tuple)
+        second_half = gf.boolean(reference, high_mask, operation="and", layer=layer_tuple)
 
         _remove_reference(component, reference)
         _remove_reference_name(component, polygon_name)
 
         new_refs: List[str] = []
-        if inside.get_polygons():
-            ref_inside = component.add_ref(inside, name=f"{polygon_name}_part1")
-            _register_reference_name(component, ref_inside.name, ref_inside)
-            new_refs.append(ref_inside.name)
-        if outside.get_polygons():
-            ref_outside = component.add_ref(outside, name=f"{polygon_name}_part2")
-            _register_reference_name(component, ref_outside.name, ref_outside)
-            new_refs.append(ref_outside.name)
+        if first_half.get_polygons():
+            ref_first = component.add_ref(first_half, name=f"{polygon_name}_part1")
+            _register_reference_name(component, ref_first.name, ref_first)
+            new_refs.append(ref_first.name)
+        if second_half.get_polygons():
+            ref_second = component.add_ref(second_half, name=f"{polygon_name}_part2")
+            _register_reference_name(component, ref_second.name, ref_second)
+            new_refs.append(ref_second.name)
 
         return {
-            "content": f"Split polygon {polygon_name} into {', '.join(new_refs)}.",
+            "content": (
+                f"Split polygon {polygon_name} with {axis}={value} into {', '.join(new_refs)}."
+            ),
             "original_polygon": polygon_name,
             "new_references": new_refs,
+            "split_axis": axis,
+            "split_value": value,
         }
 
 
@@ -545,7 +609,7 @@ if __name__ == "__main__":
         split_tool,
         {
             "polygon_name": "demo_rect",
-            "split_line_bbox": [20.0, -5.0, 60.0, 25.0],
+            "split_line": {"axis": "y", "value": 12.5},
             "layer": [1, 0],
         },
         demo_component,
